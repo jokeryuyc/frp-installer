@@ -297,3 +297,311 @@ modify_config() {
     
     return 0
 }
+
+# 显示状态
+show_status() {
+    local mode=$(get_installed_mode)
+    
+    echo -e "\n${CYAN}${BOLD}FRP状态:${RESET}"
+    if [ "$mode" == "frps" ]; then
+        systemctl status frps --no-pager
+        display_config
+    elif [ "$mode" == "frpc" ]; then
+        systemctl status frpc --no-pager
+        display_config
+    else
+        error "未检测到FRP服务"
+        return 1
+    fi
+}
+
+# 安装FRP服务端
+install_frps() {
+    MODE="frps"
+    SERVICE_NAME="frps"
+    BINARY_NAME="frps"
+    CONF_FILE="frps.ini"
+
+    info "✨ 开始安装FRP服务端..."
+    
+    # 获取用户配置
+    echo -e "\n${BLUE}${BOLD}配置FRP服务端参数:${RESET} (直接按回车使用默认值)"
+    read -p "服务端端口 [默认: $SERVER_PORT]: " input_server_port
+    SERVER_PORT=${input_server_port:-$SERVER_PORT}
+    
+    read -p "管理面板端口 [默认: $DASHBOARD_PORT]: " input_dashboard_port
+    DASHBOARD_PORT=${input_dashboard_port:-$DASHBOARD_PORT}
+    
+    read -p "管理面板用户名 [默认: $DASHBOARD_USER]: " input_dashboard_user
+    DASHBOARD_USER=${input_dashboard_user:-$DASHBOARD_USER}
+    
+    read -p "管理面板密码 [默认: $DASHBOARD_PWD]: " input_dashboard_pwd
+    DASHBOARD_PWD=${input_dashboard_pwd:-$DASHBOARD_PWD}
+    
+    read -p "认证令牌 (留空则不设置): " TOKEN
+    
+    # 下载和安装FRP
+    install_frp
+    
+    # 创建配置文件
+    sudo tee $INSTALL_DIR/frps.ini > /dev/null <<EOF
+[common]
+bind_port = $SERVER_PORT
+dashboard_port = $DASHBOARD_PORT
+dashboard_user = $DASHBOARD_USER
+dashboard_pwd = $DASHBOARD_PWD
+EOF
+
+    # 如果提供了TOKEN，则添加到配置中
+    if [ -n "$TOKEN" ]; then
+        echo "token = $TOKEN" >> $INSTALL_DIR/frps.ini
+    fi
+    
+    # 设置服务并启动
+    setup_service
+    
+    # 显示完成信息
+    local PUBLIC_IP=$(curl -s ifconfig.me || hostname -I | awk '{print $1}')
+    
+    success "🎉 FRP服务端安装完成！"
+    echo -e "\n${CYAN}${BOLD}服务端信息:${RESET}"
+    echo -e "${YELLOW}--------------------------------------${RESET}"
+    echo -e "${YELLOW}服务端地址:${RESET} $PUBLIC_IP"
+    echo -e "${YELLOW}服务端端口:${RESET} $SERVER_PORT"
+    echo -e "${YELLOW}管理面板:${RESET} http://$PUBLIC_IP:$DASHBOARD_PORT"
+    echo -e "${YELLOW}管理面板用户名:${RESET} $DASHBOARD_USER"
+    echo -e "${YELLOW}管理面板密码:${RESET} $DASHBOARD_PWD"
+    if [ -n "$TOKEN" ]; then
+        echo -e "${YELLOW}认证令牌:${RESET} $TOKEN"
+    fi
+    echo -e "${YELLOW}--------------------------------------${RESET}"
+    echo -e "${GREEN}配置文件位置:${RESET} $INSTALL_DIR/frps.ini"
+    echo -e "${GREEN}重启服务命令:${RESET} sudo systemctl restart frps"
+    echo -e "${GREEN}查看状态命令:${RESET} sudo systemctl status frps"
+}
+
+# 安装FRP客户端
+install_frpc() {
+    MODE="frpc"
+    SERVICE_NAME="frpc"
+    BINARY_NAME="frpc"
+    CONF_FILE="frpc.ini"
+
+    info "✨ 开始安装FRP客户端..."
+    
+    # 获取用户配置
+    echo -e "\n${BLUE}${BOLD}配置FRP客户端参数:${RESET} (直接按回车使用默认值)"
+    read -p "服务端地址: " SERVER_ADDR
+    while [ -z "$SERVER_ADDR" ]; do
+        error "服务端地址不能为空"
+        read -p "服务端地址: " SERVER_ADDR
+    done
+    
+    read -p "服务端端口 [默认: $SERVER_PORT]: " input_server_port
+    SERVER_PORT=${input_server_port:-$SERVER_PORT}
+    
+    read -p "认证令牌 (如果服务端设置了token): " TOKEN
+    
+    read -p "本地SSH端口 [默认: $LOCAL_PORT]: " input_local_port
+    LOCAL_PORT=${input_local_port:-$LOCAL_PORT}
+    
+    read -p "远程映射端口 [默认: $REMOTE_PORT]: " input_remote_port
+    REMOTE_PORT=${input_remote_port:-$REMOTE_PORT}
+    
+    # 下载和安装FRP
+    install_frp
+    
+    # 创建基本配置文件
+    sudo tee $INSTALL_DIR/frpc.ini > /dev/null <<EOF
+[common]
+server_addr = $SERVER_ADDR
+server_port = $SERVER_PORT
+EOF
+
+    # 如果提供了TOKEN，则添加到配置中
+    if [ -n "$TOKEN" ]; then
+        echo "token = $TOKEN" >> $INSTALL_DIR/frpc.ini
+    fi
+    
+    # 添加SSH配置
+    sudo tee -a $INSTALL_DIR/frpc.ini > /dev/null <<EOF
+
+[ssh]
+type = tcp
+local_ip = 127.0.0.1
+local_port = $LOCAL_PORT
+remote_port = $REMOTE_PORT
+EOF
+
+    # 询问是否需要添加更多转发规则
+    echo -e "\n${BLUE}${BOLD}是否添加更多转发规则?${RESET} (例如Web, RDP等)"
+    read -p "添加更多规则? [y/N]: " add_more_rules
+    
+    if [[ "$add_more_rules" == [yY] ]]; then
+        while true; do
+            echo -e "\n${CYAN}添加新的转发规则:${RESET} (输入q退出)"
+            read -p "规则名称 (例如: web, rdp) 或q退出: " rule_name
+            
+            if [[ "$rule_name" == "q" ]]; then
+                break
+            fi
+            
+            read -p "协议类型 [tcp/http/https/udp]: " rule_type
+            read -p "本地IP [默认127.0.0.1]: " rule_local_ip
+            rule_local_ip=${rule_local_ip:-127.0.0.1}
+            read -p "本地端口: " rule_local_port
+            
+            # 添加新规则到配置
+            sudo tee -a $INSTALL_DIR/frpc.ini > /dev/null <<EOF
+
+[$rule_name]
+type = $rule_type
+local_ip = $rule_local_ip
+local_port = $rule_local_port
+EOF
+
+            if [[ "$rule_type" == "tcp" || "$rule_type" == "udp" ]]; then
+                read -p "远程端口: " rule_remote_port
+                echo "remote_port = $rule_remote_port" | sudo tee -a $INSTALL_DIR/frpc.ini > /dev/null
+            elif [[ "$rule_type" == "http" || "$rule_type" == "https" ]]; then
+                read -p "域名: " rule_domain
+                echo "custom_domains = $rule_domain" | sudo tee -a $INSTALL_DIR/frpc.ini > /dev/null
+            fi
+        done
+    fi
+    
+    # 设置服务并启动
+    setup_service
+    
+    # 显示完成信息
+    success "🎉 FRP客户端安装完成！"
+    echo -e "\n${CYAN}${BOLD}客户端信息:${RESET}"
+    echo -e "${YELLOW}--------------------------------------${RESET}"
+    echo -e "${YELLOW}连接到服务器:${RESET} $SERVER_ADDR:$SERVER_PORT"
+    echo -e "${YELLOW}SSH映射:${RESET} $SERVER_ADDR:$REMOTE_PORT -> 本地${LOCAL_PORT}端口"
+    if [ -n "$TOKEN" ]; then
+        echo -e "${YELLOW}认证令牌:${RESET} $TOKEN"
+    fi
+    echo -e "${YELLOW}--------------------------------------${RESET}"
+    echo -e "${GREEN}配置文件位置:${RESET} $INSTALL_DIR/frpc.ini"
+    echo -e "${GREEN}重启服务命令:${RESET} sudo systemctl restart frpc"
+    echo -e "${GREEN}查看状态命令:${RESET} sudo systemctl status frpc"
+}
+
+# 公共安装函数
+install_frp() {
+    # 下载FRP
+    cd /tmp
+    FRP_FILE="frp_${FRP_VERSION#v}_linux_${ARCH}.tar.gz"
+    info "正在下载FRP $FRP_VERSION..."
+    wget -q --show-progress https://github.com/fatedier/frp/releases/download/${FRP_VERSION}/${FRP_FILE}
+    tar -xzf $FRP_FILE
+    cd frp_${FRP_VERSION#v}_linux_${ARCH}
+
+    # 安装目录
+    sudo mkdir -p $INSTALL_DIR
+    sudo chmod +x ${BINARY_NAME}
+    sudo cp ${BINARY_NAME} $INSTALL_DIR
+    rm -f ${BINARY_NAME}
+}
+
+# 配置系统服务
+setup_service() {
+    # 设置systemd服务
+    sudo tee /etc/systemd/system/${SERVICE_NAME}.service > /dev/null <<EOF
+[Unit]
+Description=FRP ${MODE^^} Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${INSTALL_DIR}/${BINARY_NAME} -c ${INSTALL_DIR}/${CONF_FILE}
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 启动服务
+    sudo systemctl daemon-reexec
+    sudo systemctl daemon-reload
+    sudo systemctl enable ${SERVICE_NAME}
+    sudo systemctl restart ${SERVICE_NAME}
+
+    # 验证服务状态
+    if systemctl is-active --quiet ${SERVICE_NAME}; then
+        info "✅ 服务已成功启动"
+    else
+        error "❌ 服务启动失败，请检查配置和日志"
+        sudo journalctl -u ${SERVICE_NAME} --no-pager -n 20
+        exit 1
+    fi
+}
+
+# 主函数
+main() {
+    # 显示横幅
+    show_banner
+    
+    # 检查是否为root用户
+    if [ "$EUID" -ne 0 ]; then
+        if ! command -v sudo &> /dev/null; then
+            error "此脚本需要以root权限运行，请使用sudo或以root用户身份运行"
+            exit 1
+        fi
+    fi
+    
+    # 检查是否已安装
+    if check_installed; then
+        echo -e "\n${BLUE}${BOLD}检测到已安装FRP，请选择操作:${RESET}"
+        echo "1) 显示当前状态"
+        echo "2) 修改配置"
+        echo "3) 卸载FRP"
+        echo "4) 重新安装"
+        read -p "请输入选项 [1-4]: " choice
+        
+        case "$choice" in
+            1)
+                show_status
+                ;;
+            2)
+                modify_config
+                ;;
+            3)
+                uninstall_frp
+                ;;
+            4)
+                uninstall_frp
+                # 继续安装流程
+                ;;
+            *)
+                error "无效选项"
+                exit 1
+                ;;
+        esac
+    fi
+    
+    # 如果未安装或选择重新安装
+    if ! check_installed; then
+        echo -e "\n${BLUE}${BOLD}请选择要安装的FRP模式:${RESET}"
+        echo "1) frps (服务端 - 运行在公网服务器)"
+        echo "2) frpc (客户端 - 运行在内网机器)"
+        read -p "请输入选项 [1/2]: " mode_choice
+        
+        case "$mode_choice" in
+            1)
+                install_frps
+                ;;
+            2)
+                install_frpc
+                ;;
+            *)
+                error "无效选项！退出"
+                exit 1
+                ;;
+        esac
+    fi
+}
+
+# 执行主函数
+main "$@"
